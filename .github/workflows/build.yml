@@ -1,0 +1,249 @@
+name: Build Flutter APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: "URL download ZIP project Flutter"
+        required: true
+      tag:
+        description: "Tag build"
+        required: true
+      build_type:
+        description: "debug / release"
+        required: true
+        default: "release"
+      only_analyze:
+        description: "Hanya jalankan analyze (true/false)"
+        required: false
+        default: "false"
+      pat_token:
+        description: "Token untuk download ZIP private"
+        required: false
+        default: ""
+
+concurrency:
+  group: flutter-build-${{ github.ref }}-${{ github.event.inputs.tag }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      PUB_CACHE: /opt/pub-cache
+      GRADLE_USER_HOME: /opt/gradle-home
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+      FLUTTER_ROOT: /opt/flutter
+      FLUTTER_CLI_ANALYTICS: "false"
+      FLUTTER_SUPPRESS_ANALYTICS: "true"
+      DART_DISABLE_ANALYTICS: "true"
+      GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.parallel=true -Dorg.gradle.caching=true -Dorg.gradle.configureondemand=true -Dorg.gradle.workers.max=4 -Dorg.gradle.jvmargs=-Xmx2500m -XX:+UseParallelGC -XX:MaxMetaspaceSize=512m -Dkotlin.incremental=false -Dkotlin.parallel.tasks.in.project=true -Dkapt.use.worker.api=true"
+      JAVA_OPTS: "-Xmx2500m -XX:+UseParallelGC"
+
+    steps:
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Cache Pub
+        uses: actions/cache@v4
+        with:
+          path: /opt/pub-cache
+          key: pub-global-linux-v7
+          restore-keys: pub-global-linux-v7
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            /opt/gradle-home/caches
+            /opt/gradle-home/wrapper
+          key: gradle-linux-v7
+          restore-keys: gradle-linux-v7
+
+      - name: Setup Flutter
+        run: |
+          if [ -d /opt/flutter ] && /opt/flutter/bin/flutter --version 2>/dev/null | grep -q "Flutter"; then
+            echo "Flutter dari cache"
+          else
+            git clone --depth 1 --branch stable https://github.com/flutter/flutter.git /opt/flutter 2>&1 | tail -3
+          fi
+          /opt/flutter/bin/flutter precache --android --no-ios --no-web 2>&1 | tail -3
+          /opt/flutter/bin/flutter --version
+          echo "/opt/flutter/bin" >> $GITHUB_PATH
+
+      - name: Download ZIP
+        timeout-minutes: 4
+        env:
+          ZIP_URL: ${{ github.event.inputs.zip_url }}
+          INPUT_PAT_TOKEN: ${{ github.event.inputs.pat_token }}
+          SECRET_PAT_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          set -eo pipefail
+          TOKEN="${INPUT_PAT_TOKEN:-${SECRET_PAT_TOKEN:-}}"
+          download_zip() {
+            if [ -n "$TOKEN" ]; then
+              curl -fLsS -o /tmp/project.zip -w "%{http_code}" -H "Authorization: Bearer $TOKEN" -H "Accept: application/octet-stream" --connect-timeout 15 --max-time 120 "$ZIP_URL"
+            else
+              curl -fLsS -o /tmp/project.zip -w "%{http_code}" -H "Accept: application/octet-stream" --connect-timeout 15 --max-time 120 "$ZIP_URL"
+            fi
+          }
+          for i in $(seq 1 5); do
+            HTTP_CODE=$(download_zip || echo "000")
+            [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "302" ] && { echo "OK"; break; }
+            rm -f /tmp/project.zip
+            [ "$i" = "5" ] && { echo "GAGAL $HTTP_CODE"; exit 1; }
+            sleep 5
+          done
+          file /tmp/project.zip | grep -qi "zip" || { echo "Bukan ZIP valid"; exit 1; }
+          echo "ZIP $(du -sh /tmp/project.zip | cut -f1)"
+
+      - name: Extract ZIP
+        run: |
+          set -eo pipefail
+          mkdir -p project_raw
+          unzip -q /tmp/project.zip -d project_raw
+          rm -f /tmp/project.zip
+          TOP_DIRS=$(find project_raw -mindepth 1 -maxdepth 1 -type d | wc -l)
+          TOP_FILES=$(find project_raw -mindepth 1 -maxdepth 1 -type f | wc -l)
+          if [ "$TOP_DIRS" -eq 1 ] && [ "$TOP_FILES" -eq 0 ]; then
+            ROOT=$(find project_raw -mindepth 1 -maxdepth 1 -type d | head -1)
+          else
+            ROOT="project_raw"
+          fi
+          echo "PROJECT_DIR=${ROOT%/}" >> $GITHUB_ENV
+          echo "Extracted: ${ROOT%/}"
+
+      - name: Fix Gradle + AGP + Kotlin
+        run: |
+          set -eo pipefail
+          ANDROID_DIR="$PROJECT_DIR/android"
+          [ ! -d "$ANDROID_DIR" ] && { echo "skip"; exit 0; }
+          WRAPPER="$ANDROID_DIR/gradle/wrapper/gradle-wrapper.properties"
+          [ -f "$WRAPPER" ] && sed -i 's|distributionUrl=.*|distributionUrl=https\://services.gradle.org/distributions/gradle-8.14.1-bin.zip|g' "$WRAPPER"
+          for F in "$ANDROID_DIR/settings.gradle" "$ANDROID_DIR/settings.gradle.kts"; do
+            [ ! -f "$F" ] && continue
+            sed -i 's/\(id[[:space:]]*([[:space:]]*"com\.android\.application"[[:space:]]*)[[:space:]]*version[[:space:]]*\)"[0-9.]*"/\1"8.11.1"/g' "$F"
+            sed -i 's/\(id[[:space:]]*([[:space:]]*"org\.jetbrains\.kotlin\.android"[[:space:]]*)[[:space:]]*version[[:space:]]*\)"[0-9.]*"/\1"2.2.20"/g' "$F"
+          done
+          for F in "$ANDROID_DIR/build.gradle" "$ANDROID_DIR/build.gradle.kts"; do
+            [ ! -f "$F" ] && continue
+            sed -i "s/classpath[[:space:]]*'com\.android\.tools\.build:gradle:[0-9.]*'/classpath 'com.android.tools.build:gradle:8.11.1'/g" "$F"
+            sed -i 's/classpath[[:space:]]*"com\.android\.tools\.build:gradle:[0-9.]*"/classpath "com.android.tools.build:gradle:8.11.1"/g' "$F"
+            sed -i "s/classpath[[:space:]]*'org\.jetbrains\.kotlin:kotlin-gradle-plugin:[0-9.]*'/classpath 'org.jetbrains.kotlin:kotlin-gradle-plugin:2.2.20'/g" "$F"
+            sed -i 's/classpath[[:space:]]*"org\.jetbrains\.kotlin:kotlin-gradle-plugin:[0-9.]*"/classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:2.2.20"/g' "$F"
+            sed -i 's/\(id[[:space:]]*([[:space:]]*"org\.jetbrains\.kotlin\.android"[[:space:]]*)[[:space:]]*version[[:space:]]*\)"[0-9.]*"/\1"2.2.20"/g' "$F"
+          done
+          for F in "$ANDROID_DIR/app/build.gradle" "$ANDROID_DIR/app/build.gradle.kts"; do
+            [ ! -f "$F" ] && continue
+            sed -i 's/\(id[[:space:]]*([[:space:]]*"org\.jetbrains\.kotlin\.android"[[:space:]]*)[[:space:]]*version[[:space:]]*\)"[0-9.]*"/\1"2.2.20"/g' "$F"
+            sed -i "s/ext\.kotlin_version[[:space:]]*=[[:space:]]*'[0-9.]*'/ext.kotlin_version = '2.2.20'/g" "$F"
+            sed -i 's/ext\.kotlin_version[[:space:]]*=[[:space:]]*"[0-9.]*"/ext.kotlin_version = "2.2.20"/g' "$F"
+          done
+          echo "Fix Gradle+AGP+Kotlin done"
+
+      - name: Fix incompatible packages
+        run: |
+          set -eo pipefail
+          PUBSPEC="$PROJECT_DIR/pubspec.yaml"
+          [ ! -f "$PUBSPEC" ] && { echo "Bukan Flutter project, skip"; exit 0; }
+
+          # Decode dan jalankan fix script via Node.js
+          echo "Y29uc3QgZnMgPSByZXF1aXJlKCdmcycpOwpjb25zdCBwYXRoID0gcmVxdWlyZSgncGF0aCcpOwoKY29uc3QgcHJvamVjdERpciA9IHByb2Nlc3MuYXJndlsyXTsKaWYgKCFwcm9qZWN0RGlyKSB7IGNvbnNvbGUuZXJyb3IoJ05vIHByb2plY3QgZGlyJyk7IHByb2Nlc3MuZXhpdCgxKTsgfQoKY29uc3QgcHVic3BlY1BhdGggPSBwYXRoLmpvaW4ocHJvamVjdERpciwgJ3B1YnNwZWMueWFtbCcpOwppZiAoIWZzLmV4aXN0c1N5bmMocHVic3BlY1BhdGgpKSB7IGNvbnNvbGUubG9nKCdObyBwdWJzcGVjLnlhbWwsIHNraXAnKTsgcHJvY2Vzcy5leGl0KDApOyB9CgpsZXQgcHVic3BlYyA9IGZzLnJlYWRGaWxlU3luYyhwdWJzcGVjUGF0aCwgJ3V0ZjgnKTsKaWYgKCFwdWJzcGVjLmluY2x1ZGVzKCdmb250X2F3ZXNvbWVfZmx1dHRlcicpKSB7IGNvbnNvbGUubG9nKCdObyBmb250X2F3ZXNvbWVfZmx1dHRlciwgc2tpcCcpOyBwcm9jZXNzLmV4aXQoMCk7IH0KCmNvbnNvbGUubG9nKCdmb250X2F3ZXNvbWVfZmx1dHRlciBmb3VuZCwgZml4aW5nLi4uJyk7CgovLyBIYXB1cyBmb250X2F3ZXNvbWVfZmx1dHRlciBkYXJpIHB1YnNwZWMueWFtbApwdWJzcGVjID0gcHVic3BlYy5zcGxpdCgnXG4nKS5maWx0ZXIobGluZSA9PiAhbGluZS5pbmNsdWRlcygnZm9udF9hd2Vzb21lX2ZsdXR0ZXInKSkuam9pbignXG4nKTsKZnMud3JpdGVGaWxlU3luYyhwdWJzcGVjUGF0aCwgcHVic3BlYyk7CmNvbnNvbGUubG9nKCdwdWJzcGVjLnlhbWwgZml4ZWQnKTsKCi8vIE1hcCBGb250QXdlc29tZUljb25zIC0+IEljb25zCmNvbnN0IGljb25NYXAgPSB7CiAgJ0ZvbnRBd2Vzb21lSWNvbnMuYm9va09wZW4nOiAnSWNvbnMubWVudV9ib29rJywKICAnRm9udEF3ZXNvbWVJY29ucy5idWcnOiAnSWNvbnMuYnVnX3JlcG9ydCcsCiAgJ0ZvbnRBd2Vzb21lSWNvbnMuY2FsZW5kYXJEYXknOiAnSWNvbnMuY2FsZW5kYXJfdG9kYXknLAogICdGb250QXdlc29tZUljb25zLmNhbGVuZGFyUGx1cyc6ICdJY29ucy5jYWxlbmRhcl9tb250aCcsCiAgJ0ZvbnRBd2Vzb21lSWNvbnMuY2FtZXJhJzogJ0ljb25zLmNhbWVyYV9hbHQnLAogICdGb250QXdlc29tZUljb25zLmNsb2NrJzogJ0ljb25zLmFjY2Vzc190aW1lJywKICAnRm9udEF3ZXNvbWVJY29ucy5maXJlJzogJ0ljb25zLmxvY2FsX2ZpcmVfZGVwYXJ0bWVudCcsCiAgJ0ZvbnRBd2Vzb21lSWNvbnMuZ3JhZHVhdGlvbkNhcCc6ICdJY29ucy5zY2hvb2wnLAogICdGb250QXdlc29tZUljb25zLmluc3RhZ3JhbSc6ICdJY29ucy5waG90b19jYW1lcmEnLAogICdGb250QXdlc29tZUljb25zLmxvY2snOiAnSWNvbnMubG9jaycsCiAgJ0ZvbnRBd2Vzb21lSWNvbnMubXVzaWMnOiAnSWNvbnMubXVzaWNfbm90ZScsCiAgJ0ZvbnRBd2Vzb21lSWNvbnMucGFwZXJQbGFuZSc6ICdJY29ucy5zZW5kJywKICAnRm9udEF3ZXNvbWVJY29ucy50ZWxlZ3JhbSc6ICdJY29ucy5zZW5kJywKICAnRm9udEF3ZXNvbWVJY29ucy50aWt0b2snOiAnSWNvbnMucGxheV9jaXJjbGUnLAogICdGb250QXdlc29tZUljb25zLnVzZXJBc3Ryb25hdXQnOiAnSWNvbnMucGVyc29uJywKICAnRm9udEF3ZXNvbWVJY29ucy51c2VyRWRpdCc6ICdJY29ucy5lZGl0JywKICAnRm9udEF3ZXNvbWVJY29ucy51c2VyUGx1cyc6ICdJY29ucy5wZXJzb25fYWRkJywKICAnRm9udEF3ZXNvbWVJY29ucy51c2VyU2hpZWxkJzogJ0ljb25zLmFkbWluX3BhbmVsX3NldHRpbmdzJywKICAnRm9udEF3ZXNvbWVJY29ucy51c2VyU2xhc2gnOiAnSWNvbnMucGVyc29uX29mZicsCiAgJ0ZvbnRBd2Vzb21lSWNvbnMudXNlcnMnOiAnSWNvbnMuZ3JvdXAnLAogICdGb250QXdlc29tZUljb25zLndoYXRzYXBwJzogJ0ljb25zLmNoYXQnLAogICdGb250QXdlc29tZUljb25zLnVzZXInOiAnSWNvbnMucGVyc29uJywKfTsKCmZ1bmN0aW9uIGZpeERhcnRGaWxlcyhkaXIpIHsKICBpZiAoIWZzLmV4aXN0c1N5bmMoZGlyKSkgcmV0dXJuOwogIGNvbnN0IGl0ZW1zID0gZnMucmVhZGRpclN5bmMoZGlyKTsKICBmb3IgKGNvbnN0IGl0ZW0gb2YgaXRlbXMpIHsKICAgIGNvbnN0IGZ1bGxQYXRoID0gcGF0aC5qb2luKGRpciwgaXRlbSk7CiAgICBjb25zdCBzdGF0ID0gZnMuc3RhdFN5bmMoZnVsbFBhdGgpOwogICAgaWYgKHN0YXQuaXNEaXJlY3RvcnkoKSkgeyBmaXhEYXJ0RmlsZXMoZnVsbFBhdGgpOyBjb250aW51ZTsgfQogICAgaWYgKCFpdGVtLmVuZHNXaXRoKCcuZGFydCcpKSBjb250aW51ZTsKICAgIAogICAgbGV0IGNvbnRlbnQgPSBmcy5yZWFkRmlsZVN5bmMoZnVsbFBhdGgsICd1dGY4Jyk7CiAgICBsZXQgY2hhbmdlZCA9IGZhbHNlOwogICAgCiAgICAvLyBIYXB1cyBpbXBvcnQKICAgIGlmIChjb250ZW50LmluY2x1ZGVzKCdmb250X2F3ZXNvbWVfZmx1dHRlcicpKSB7CiAgICAgIGNvbnRlbnQgPSBjb250ZW50LnNwbGl0KCdcbicpLmZpbHRlcihsID0+ICFsLmluY2x1ZGVzKCdmb250X2F3ZXNvbWVfZmx1dHRlcicpKS5qb2luKCdcbicpOwogICAgICBjaGFuZ2VkID0gdHJ1ZTsKICAgIH0KICAgIAogICAgLy8gUmVwbGFjZSBGYUljb24gLT4gSWNvbgogICAgaWYgKGNvbnRlbnQuaW5jbHVkZXMoJ0ZhSWNvbignKSkgewogICAgICBjb250ZW50ID0gY29udGVudC5yZXBsYWNlKC9GYUljb25cKC9nLCAnSWNvbignKTsKICAgICAgY2hhbmdlZCA9IHRydWU7CiAgICB9CiAgICAKICAgIC8vIFJlcGxhY2UgRm9udEF3ZXNvbWVJY29ucy54eHggKGxlYmloIHNwZXNpZmlrIGR1bHUsIGxhbHUgdW11bSkKICAgIGZvciAoY29uc3QgW2Zyb20sIHRvXSBvZiBPYmplY3QuZW50cmllcyhpY29uTWFwKSkgewogICAgICBpZiAoY29udGVudC5pbmNsdWRlcyhmcm9tKSkgewogICAgICAgIGNvbnRlbnQgPSBjb250ZW50LnNwbGl0KGZyb20pLmpvaW4odG8pOwogICAgICAgIGNoYW5nZWQgPSB0cnVlOwogICAgICB9CiAgICB9CiAgICAKICAgIC8vIEZhbGxiYWNrOiBzZW11YSBGb250QXdlc29tZUljb25zLnh4eCB5YW5nIGJlbHVtIHRlci1tYXAgLT4gSWNvbnMuc3RhcgogICAgaWYgKGNvbnRlbnQuaW5jbHVkZXMoJ0ZvbnRBd2Vzb21lSWNvbnMuJykpIHsKICAgICAgY29udGVudCA9IGNvbnRlbnQucmVwbGFjZSgvRm9udEF3ZXNvbWVJY29uc1wuW2EtekEtWjAtOV9dKy9nLCAnSWNvbnMuc3RhcicpOwogICAgICBjaGFuZ2VkID0gdHJ1ZTsKICAgIH0KICAgIAogICAgaWYgKGNoYW5nZWQpIHsKICAgICAgZnMud3JpdGVGaWxlU3luYyhmdWxsUGF0aCwgY29udGVudCk7CiAgICAgIGNvbnNvbGUubG9nKCdGaXhlZDogJyArIGZ1bGxQYXRoKTsKICAgIH0KICB9Cn0KCmZpeERhcnRGaWxlcyhwYXRoLmpvaW4ocHJvamVjdERpciwgJ2xpYicpKTsKY29uc29sZS5sb2coJ0FsbCBkYXJ0IGZpbGVzIGZpeGVkJyk7Cg==" | base64 -d > /tmp/fix_packages.js
+          node /tmp/fix_packages.js "$PROJECT_DIR"
+          echo "Package fix done"
+
+      - name: Flutter pub get
+        timeout-minutes: 5
+        run: |
+          set -eo pipefail
+          cd "$PROJECT_DIR"
+          [ -d android ] && echo "sdk.dir=$ANDROID_HOME" > android/local.properties || true
+          flutter pub get --no-precompile
+          echo "pub get done"
+
+      - name: Analyze
+        if: ${{ github.event.inputs.only_analyze == 'true' }}
+        run: |
+          cd "$PROJECT_DIR"
+          flutter analyze --no-fatal-infos 2>&1 | tail -20
+
+      - name: Build APK
+        if: ${{ github.event.inputs.only_analyze != 'true' }}
+        timeout-minutes: 15
+        run: |
+          set -eo pipefail
+          BUILD_TYPE="${{ github.event.inputs.build_type }}"
+          START=$(date +%s)
+          cd "$PROJECT_DIR"
+          [ -d android ] && echo "sdk.dir=$ANDROID_HOME" > android/local.properties
+          if [ -f "pubspec.yaml" ]; then
+            flutter build apk --$BUILD_TYPE --no-pub --suppress-analytics --no-tree-shake-icons --target-platform android-arm64
+          else
+            GRADLE_PATH=$(find . -name "gradlew" ! -path "*/.gradle/*" ! -path "*/build/*" | head -1)
+            [ -z "$GRADLE_PATH" ] && { echo "gradlew tidak ditemukan"; exit 1; }
+            GRADLE_DIR=$(dirname "$GRADLE_PATH")
+            chmod +x "$GRADLE_PATH"
+            echo "sdk.dir=$ANDROID_HOME" > "$GRADLE_DIR/local.properties"
+            [ ! -f "$GRADLE_DIR/gradle.properties" ] && touch "$GRADLE_DIR/gradle.properties"
+            printf "\nkotlin.parallel.tasks.in.project=true\nkapt.use.worker.api=true\nandroid.enableR8.fullMode=false\n" >> "$GRADLE_DIR/gradle.properties"
+            cd "$GRADLE_DIR"
+            [ "$BUILD_TYPE" = "debug" ] && TASK="assembleDebug" || TASK="assembleRelease"
+            ./gradlew "$TASK" --no-daemon --parallel --build-cache --configure-on-demand --warning-mode=none -x test -x lint --console=plain
+          fi
+          echo "BUILD OK $(( $(date +%s) - START ))s"
+
+      - name: Find APK
+        if: ${{ github.event.inputs.only_analyze != 'true' }}
+        run: |
+          set -eo pipefail
+          BUILD_TYPE="${{ github.event.inputs.build_type }}"
+          if [ "$BUILD_TYPE" = "debug" ]; then
+            APK=$(find "$PROJECT_DIR/build" -name "*debug*.apk" ! -name "*unsigned*" 2>/dev/null | head -1)
+          else
+            APK=$(find "$PROJECT_DIR/build" -name "app-release.apk" 2>/dev/null | head -1)
+            [ -z "$APK" ] && APK=$(find "$PROJECT_DIR/build" -name "*release*.apk" ! -name "*unsigned*" 2>/dev/null | head -1)
+            [ -z "$APK" ] && APK=$(find "$PROJECT_DIR/build" -name "*release*.apk" 2>/dev/null | head -1)
+          fi
+          [ -z "$APK" ] && APK=$(find "$GITHUB_WORKSPACE" -name "*.apk" 2>/dev/null | head -1)
+          [ -z "$APK" ] && { echo "APK tidak ditemukan"; exit 1; }
+          APK_ABS=$(realpath "$APK")
+          echo "APK: $(basename $APK_ABS) $(du -sh $APK_ABS | cut -f1)"
+          echo "APK_ABS_PATH=$APK_ABS" >> $GITHUB_ENV
+
+      - name: Press APK
+        if: ${{ github.event.inputs.only_analyze != 'true' }}
+        run: |
+          set -eo pipefail
+          APK_PATH="${{ env.APK_ABS_PATH }}"
+          PRESSED_PATH="${APK_PATH%.apk}_pressed.apk"
+          IS_SIGNED=$(node -e "const fs=require('fs');try{const fd=fs.openSync(process.argv[1],'r');const sz=fs.fstatSync(fd).size;const buf=Buffer.alloc(Math.min(65558,sz));fs.readSync(fd,buf,0,buf.length,sz-buf.length);fs.closeSync(fd);let off=-1;for(let i=buf.length-22;i>=0;i--){if(buf[i]===0x50&&buf[i+1]===0x4b&&buf[i+2]===0x05&&buf[i+3]===0x06){off=i;break;}}if(off<0){process.stdout.write('false');process.exit(0);}const cd=buf.readUInt32LE(off+16);if(cd<24){process.stdout.write('false');process.exit(0);}const fd2=fs.openSync(process.argv[1],'r');const magic=Buffer.alloc(16);fs.readSync(fd2,magic,0,16,cd-16);fs.closeSync(fd2);process.stdout.write(magic.toString('utf8')==='APK Sig Block 42'?'true':'false');}catch(e){process.stdout.write('false');}" "$APK_PATH")
+          if [ "$IS_SIGNED" = "true" ]; then
+            echo "APK signed skip press"
+            echo "APK_ABS_PATH=$APK_PATH" >> $GITHUB_ENV
+            exit 0
+          fi
+          echo "Y29uc3QgZnM9cmVxdWlyZSgiZnMiKSx6bGliPXJlcXVpcmUoInpsaWIiKTsKY29uc3QgW2lucCxvdXRdPXByb2Nlc3MuYXJndi5zbGljZSgyKTsKY29uc3QgVD1uZXcgVWludDMyQXJyYXkoMjU2KTsKZm9yKGxldCBpPTA7aTwyNTY7aSsrKXtsZXQgYz1pO2ZvcihsZXQgaj0wO2o8ODtqKyspYz1jJjE/KDB4ZWRiODgzMjBeKGM+Pj4xKSk6KGM+Pj4xKTtUW2ldPWM7fQpmdW5jdGlvbiBjcmMzMihiKXtsZXQgYz0weGZmZmZmZmZmO2ZvcihsZXQgaT0wO2k8Yi5sZW5ndGg7aSsrKWM9VFsoY15iW2ldKSYweGZmXV4oYz4+PjgpO3JldHVybihjXjB4ZmZmZmZmZmYpPj4+MDt9CmNvbnN0IFNUT1JFPVsvXC5wbmckL2ksL1wuanBnJC9pLC9cLmpwZWckL2ksL1wud2VicCQvaSwvXC5naWYkL2ksL1wubXA0JC9pLC9cLm1wMyQvaSwvXC5vZ2ckL2ksL1wud2F2JC9pLC9cLnNvJC9pLC9cLmRleCQvaSwvXC5hcnNjJC9pXTsKY29uc3QgSlVOSz1bL1wuRFNfU3RvcmUkL2ksL1RodW1ic1wuZGIkL2ksL15fX01BQ09TWFwvLywvXC50bXAkL2ksL34kL107CmNvbnN0IGJ1Zj1mcy5yZWFkRmlsZVN5bmMoaW5wKTsKY29uc3QgZW50cmllcz1bXTtsZXQgcG9zPTA7CndoaWxlKHBvczxidWYubGVuZ3RoLTQpewogIGlmKGJ1Zi5yZWFkVUludDMyTEUocG9zKSE9PTB4MDQwMzRiNTApe3BvcysrO2NvbnRpbnVlO30KICBjb25zdCBmbkxlbj1idWYucmVhZFVJbnQxNkxFKHBvcysyNiksZXh0TGVuPWJ1Zi5yZWFkVUludDE2TEUocG9zKzI4KTsKICBjb25zdCBuYW1lPWJ1Zi5zbGljZShwb3MrMzAscG9zKzMwK2ZuTGVuKS50b1N0cmluZygidXRmOCIpOwogIGNvbnN0IGNvbXBTej1idWYucmVhZFVJbnQzMkxFKHBvcysxOCksdW5jU3o9YnVmLnJlYWRVSW50MzJMRShwb3MrMjIpLG1ldGhvZD1idWYucmVhZFVJbnQxNkxFKHBvcys4KTsKICBjb25zdCBkYXRhU3RhcnQ9cG9zKzMwK2ZuTGVuK2V4dExlbjsKICBpZighSlVOSy5zb21lKHA9PnAudGVzdChuYW1lKSkpewogICAgbGV0IHJhdzsKICAgIGlmKG1ldGhvZD09PTgpe3RyeXtyYXc9emxpYi5pbmZsYXRlUmF3U3luYyhidWYuc2xpY2UoZGF0YVN0YXJ0LGRhdGFTdGFydCtjb21wU3opKTt9Y2F0Y2goZSl7cmF3PWJ1Zi5zbGljZShkYXRhU3RhcnQsZGF0YVN0YXJ0K2NvbXBTeik7fX0KICAgIGVsc2UgcmF3PWJ1Zi5zbGljZShkYXRhU3RhcnQsZGF0YVN0YXJ0K3VuY1N6KTsKICAgIGNvbnN0IGNrPWNyYzMyKHJhdyk7CiAgICBpZihTVE9SRS5zb21lKHA9PnAudGVzdChuYW1lKSkpZW50cmllcy5wdXNoKHtuYW1lLGNvbXA6cmF3LG1ldGhvZDowLGNyYzpjayx1bmM6cmF3Lmxlbmd0aH0pOwogICAgZWxzZXt0cnl7Y29uc3QgZD16bGliLmRlZmxhdGVSYXdTeW5jKHJhdyx7bGV2ZWw6Nn0pO2VudHJpZXMucHVzaChkLmxlbmd0aDxyYXcubGVuZ3RoP3tuYW1lLGNvbXA6ZCxtZXRob2Q6OCxjcmM6Y2ssdW5jOnJhdy5sZW5ndGh9OntuYW1lLGNvbXA6cmF3LG1ldGhvZDowLGNyYzpjayx1bmM6cmF3Lmxlbmd0aH0pO31jYXRjaChlKXtlbnRyaWVzLnB1c2goe25hbWUsY29tcDpyYXcsbWV0aG9kOjAsY3JjOmNrLHVuYzpyYXcubGVuZ3RofSk7fX0KICB9CiAgcG9zPWRhdGFTdGFydCtjb21wU3o7Cn0KY29uc3Qgbm93PW5ldyBEYXRlKCksZHQ9KG5vdy5nZXRIb3VycygpPDwxMXxub3cuZ2V0TWludXRlcygpPDw1fE1hdGguZmxvb3Iobm93LmdldFNlY29uZHMoKS8yKSksZGQ9KChub3cuZ2V0RnVsbFllYXIoKS0xOTgwKTw8OXwobm93LmdldE1vbnRoKCkrMSk8PDV8bm93LmdldERhdGUoKSk7CmNvbnN0IGxwPVtdLGNwPVtdLG9mZnNldHM9W107bGV0IHA9MDsKZm9yKGNvbnN0IGYgb2YgZW50cmllcyl7CiAgY29uc3QgbmI9QnVmZmVyLmZyb20oZi5uYW1lLCJ1dGY4Iik7b2Zmc2V0cy5wdXNoKHApOwogIGNvbnN0IGxoPUJ1ZmZlci5hbGxvY1Vuc2FmZSgzMCtuYi5sZW5ndGgpOwogIGxoLndyaXRlVUludDMyTEUoMHgwNDAzNGI1MCwwKTtsaC53cml0ZVVJbnQxNkxFKDIwLDQpO2xoLndyaXRlVUludDE2TEUoZi5tZXRob2Q9PT04PzI6MCw2KTtsaC53cml0ZVVJbnQxNkxFKGYubWV0aG9kLDgpOwogIGxoLndyaXRlVUludDE2TEUoZHQsMTApO2xoLndyaXRlVUludDE2TEUoZGQsMTIpO2xoLndyaXRlVUludDMyTEUoZi5jcmMsMTQpO2xoLndyaXRlVUludDMyTEUoZi5jb21wLmxlbmd0aCwxOCk7CiAgbGgud3JpdGVVSW50MzJMRShmLnVuYywyMik7bGgud3JpdGVVSW50MTZMRShuYi5sZW5ndGgsMjYpO2xoLndyaXRlVUludDE2TEUoMCwyOCk7bmIuY29weShsaCwzMCk7CiAgbHAucHVzaChsaCxmLmNvbXApO3ArPTMwK25iLmxlbmd0aCtmLmNvbXAubGVuZ3RoOwogIGNvbnN0IGNlPUJ1ZmZlci5hbGxvY1Vuc2FmZSg0NituYi5sZW5ndGgpOwogIGNlLndyaXRlVUludDMyTEUoMHgwMjAxNGI1MCwwKTtjZS53cml0ZVVJbnQxNkxFKDIwLDQpO2NlLndyaXRlVUludDE2TEUoMjAsNik7Y2Uud3JpdGVVSW50MTZMRShmLm1ldGhvZD09PTg/MjowLDgpO2NlLndyaXRlVUludDE2TEUoZi5tZXRob2QsMTApOwogIGNlLndyaXRlVUludDE2TEUoZHQsMTIpO2NlLndyaXRlVUludDE2TEUoZGQsMTQpO2NlLndyaXRlVUludDMyTEUoZi5jcmMsMTYpO2NlLndyaXRlVUludDMyTEUoZi5jb21wLmxlbmd0aCwyMCk7CiAgY2Uud3JpdGVVSW50MzJMRShmLnVuYywyNCk7Y2Uud3JpdGVVSW50MTZMRShuYi5sZW5ndGgsMjgpO2NlLndyaXRlVUludDE2TEUoMCwzMCk7Y2Uud3JpdGVVSW50MTZMRSgwLDMyKTtjZS53cml0ZVVJbnQxNkxFKDAsMzQpOwogIGNlLndyaXRlVUludDE2TEUoMCwzNik7Y2Uud3JpdGVVSW50MzJMRShmLm1ldGhvZD09PTg/MHgyMDowLDM4KTtjZS53cml0ZVVJbnQzMkxFKG9mZnNldHNbb2Zmc2V0cy5sZW5ndGgtMV0sNDIpO25iLmNvcHkoY2UsNDYpOwogIGNwLnB1c2goY2UpOwp9CmNvbnN0IGNkYj1CdWZmZXIuY29uY2F0KGNwKSxlb2NkPUJ1ZmZlci5hbGxvY1Vuc2FmZSgyMik7CmVvY2Qud3JpdGVVSW50MzJMRSgweDA2MDU0YjUwLDApO2VvY2Qud3JpdGVVSW50MTZMRSgwLDQpO2VvY2Qud3JpdGVVSW50MTZMRSgwLDYpOwplb2NkLndyaXRlVUludDE2TEUoZW50cmllcy5sZW5ndGgsOCk7ZW9jZC53cml0ZVVJbnQxNkxFKGVudHJpZXMubGVuZ3RoLDEwKTsKZW9jZC53cml0ZVVJbnQzMkxFKGNkYi5sZW5ndGgsMTIpO2VvY2Qud3JpdGVVSW50MzJMRShwLDE2KTtlb2NkLndyaXRlVUludDE2TEUoMCwyMCk7CmNvbnN0IHJlc3VsdD1CdWZmZXIuY29uY2F0KFsuLi5scCxjZGIsZW9jZF0pOwpmcy53cml0ZUZpbGVTeW5jKG91dCxyZXN1bHQpOwpjb25zdCBiZWZvcmU9ZnMuc3RhdFN5bmMoaW5wKS5zaXplLGFmdGVyPXJlc3VsdC5sZW5ndGgsc2F2ZWQ9TWF0aC5tYXgoMCxiZWZvcmUtYWZ0ZXIpOwpjb25zb2xlLmxvZygiSW5wdXQgOiAiKyhiZWZvcmUvMTAyNC8xMDI0KS50b0ZpeGVkKDIpKyIgTUIiKTsKY29uc29sZS5sb2coIk91dHB1dDogIisoYWZ0ZXIvMTAyNC8xMDI0KS50b0ZpeGVkKDIpKyIgTUIiKTsKY29uc29sZS5sb2coIlNhdmVkIDogIisoc2F2ZWQvMTAyNC8xMDI0KS50b0ZpeGVkKDIpKyIgTUIgKCIrKGJlZm9yZT4wPygoc2F2ZWQvYmVmb3JlKSoxMDApLnRvRml4ZWQoMSk6MCkrIiUpIik7CmNvbnNvbGUubG9nKCJQcmVzcyBkb25lIik7Cg==" | base64 -d > /tmp/press_apk.js
+          node /tmp/press_apk.js "$APK_PATH" "$PRESSED_PATH"
+          if [ -f "$PRESSED_PATH" ] && [ -s "$PRESSED_PATH" ]; then
+            echo "APK_ABS_PATH=$PRESSED_PATH" >> $GITHUB_ENV
+            echo "Pressed $(basename $PRESSED_PATH) $(du -sh $PRESSED_PATH | cut -f1)"
+          else
+            echo "Press gagal pakai original"
+            echo "APK_ABS_PATH=$APK_PATH" >> $GITHUB_ENV
+          fi
+
+      - name: Upload APK
+        if: ${{ github.event.inputs.only_analyze != 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: flutter-${{ github.event.inputs.build_type }}-${{ github.event.inputs.tag }}
+          path: ${{ env.APK_ABS_PATH }}
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0
